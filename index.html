@@ -3066,7 +3066,7 @@ function maybeShowCrisisContextWarning(sectionId) {
 //
 //     Esta página ya no trae el texto de las secciones. Cuando el jugador
 //     avanza, se le pide la sección al servidor (Cloudflare Worker), que
-//     comprueba el código de licencia con Lemon Squeezy y recién entonces la
+//     comprueba el código de acceso y recién entonces la
 //     entrega. Así, quien no pagó no tiene el contenido, ni siquiera mirando
 //     el código fuente de la página.
 //
@@ -3134,30 +3134,23 @@ function contentErrorSection(err) {
 }
 
 // ----------------------------------------------------------------------------
-// 4g. ACCESO COMPLETO — candado de licencia (Lemon Squeezy)
+// 4g. ACCESO COMPLETO — candado de licencia (códigos propios)
 //
 //     El juego es de pago único: para jugar se necesita un código de acceso
 //     que el cliente recibe por correo al pagar. El código se
-//     verifica con la API pública de licencias de Lemon Squeezy (no requiere
-//     clave API, así que no hay ningún secreto dentro de esta página).
+//     verifica con el servidor del juego (Cloudflare Worker); en esta página
+//     no hay ningún secreto. Los códigos los emite el dueño desde /panel.
 //
-//     ⚠ PARA PASAR DE PRUEBAS A VENTAS REALES se edita config.js (no este archivo):
-//        1) productIds  → agregar el product_id del producto en MODO REAL
-//        2) allowTestKeys → poner false (rechaza los códigos de prueba)
-//        3) checkoutUrl → el enlace de compra del producto en modo real
-//     Además, en Cloudflare: PRODUCT_IDS y ALLOW_TEST_KEYS del servidor (mismos valores).
+//     Para cambiar el enlace de compra o el precio mostrado se edita config.js
+//     (no este archivo).
 // ----------------------------------------------------------------------------
 // Los valores se leen de config.js (un archivo pequeño que se edita sin tocar este).
 const LM_EXT = (typeof window !== 'undefined' && window.LM_CONFIG && typeof window.LM_CONFIG === 'object') ? window.LM_CONFIG : {};
 const LICENSE_CONFIG = {
   enabled: true,
-  storeId: Number(LM_EXT.storeId) || 512778,
-  productIds: Array.isArray(LM_EXT.productIds) && LM_EXT.productIds.length ? LM_EXT.productIds.map(Number) : [1493227],   // por defecto: MODO PRUEBA
-  allowTestKeys: LM_EXT.allowTestKeys === undefined ? true : !!LM_EXT.allowTestKeys,                                      // por defecto: MODO PRUEBA
-  checkoutUrl: LM_EXT.checkoutUrl || 'https://historiasqueeligen.lemonsqueezy.com/checkout/buy/cf664e33-828f-4b7e-9477-6334e133f881',
+  checkoutUrl: LM_EXT.checkoutUrl || 'https://mpago.la/1WQSaBw',
   priceLabel: LM_EXT.priceLabel || '$4.990',
   contactEmail: LM_EXT.contactEmail || 'smontecinos0@gmail.com',
-  apiBase: 'https://api.lemonsqueezy.com/v1/licenses',
   storageKey: 'lm_license_v1',
   recheckMs: 12 * 60 * 60 * 1000      // vuelve a verificar el código cada 12 horas
 };
@@ -3195,11 +3188,12 @@ async function resumeAfterLicense() {
   else await renderCurrentPosition();
 }
 
-async function lsLicenseCall(path, params) {
-  const res = await fetch(LICENSE_CONFIG.apiBase + path, {
+/** Llama al servidor del juego (Cloudflare Worker) con un cuerpo JSON. */
+async function licenseApi(path, payload) {
+  const res = await fetch(contentApi(path), {
     method: 'POST',
-    headers: { 'Accept': 'application/json' },
-    body: new URLSearchParams(params)
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
   });
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
@@ -3213,23 +3207,12 @@ function licenseDeviceName() {
   return ('Navegador ' + plat + ' ' + rnd).replace(/[^\w .\-]/g, '').trim();
 }
 
-function classifyLicenseError(msg) {
-  const m = String(msg || '').toLowerCase();
-  if (m.indexOf('limit') !== -1) return 'limite';
-  if (m.indexOf('not found') !== -1 || m.indexOf('no longer exist') !== -1) return 'no_encontrado';
-  if (m.indexOf('disabled') !== -1) return 'desactivada';
-  if (m.indexOf('expired') !== -1) return 'vencida';
-  return 'otro';
-}
-
 function licenseErrorMessage(r) {
   const mail = LICENSE_CONFIG.contactEmail;
   switch (r.code) {
     case 'vacio': return 'Escribe o pega tu código de acceso.';
     case 'red': return 'No pude conectarme para verificar tu código. Revisa tu conexión e inténtalo de nuevo.';
     case 'no_encontrado': return 'No encontré ese código. Revisa que esté completo y copiado tal cual llegó a tu correo.';
-    case 'otro_producto': return 'Ese código no corresponde a La Moneda.';
-    case 'prueba': return 'Ese es un código de prueba y no sirve en el juego real.';
     case 'desactivada': return 'Este código fue desactivado. Escríbeme a ' + mail + ' y lo revisamos.';
     case 'vencida': return 'Este código venció. Escríbeme a ' + mail + '.';
     case 'limite': return 'Este código ya está activado en el máximo de dispositivos (' + (r.limit || 2) + '). Libera uno desde el botón "?" → "Tu acceso" en el dispositivo anterior, o escríbeme a ' + mail + '.';
@@ -3237,55 +3220,36 @@ function licenseErrorMessage(r) {
   }
 }
 
-/** Valida el código, comprueba que sea de ESTE producto y lo activa en este dispositivo. */
+/** Activa el código en este dispositivo (el servidor lo valida y cuenta la activación). */
 async function activateLicenseKey(raw) {
   const key = String(raw || '').replace(/\s+/g, '');
   if (!key) return { ok: false, code: 'vacio' };
+  if (!LM_EXT.apiUrl) return { ok: false, code: 'otro' };
 
-  let v;
-  try { v = await lsLicenseCall('/validate', { license_key: key }); }
+  let r;
+  try { r = await licenseApi('/activate', { license_key: key, device_name: licenseDeviceName() }); }
   catch (e) { return { ok: false, code: 'red' }; }
-  const vd = v.data;
-  if (!vd) return { ok: false, code: 'red' };
-
-  // 1) que pertenezca a mi tienda y a mi producto (así un código de otro producto no sirve)
-  if (vd.meta && (vd.meta.store_id !== LICENSE_CONFIG.storeId || LICENSE_CONFIG.productIds.indexOf(vd.meta.product_id) === -1)) {
-    return { ok: false, code: 'otro_producto' };
-  }
-  // 2) que no sea un código de prueba cuando ya estoy vendiendo de verdad
-  if (vd.license_key && vd.license_key.test_mode && !LICENSE_CONFIG.allowTestKeys) {
-    return { ok: false, code: 'prueba' };
-  }
-  // 3) que esté vigente
-  if (vd.valid === false || !vd.license_key) {
-    const st = vd.license_key && vd.license_key.status;
-    if (st === 'disabled') return { ok: false, code: 'desactivada' };
-    if (st === 'expired') return { ok: false, code: 'vencida' };
-    return { ok: false, code: vd.license_key ? 'otro' : 'no_encontrado' };
-  }
-
-  // 4) activarlo en este dispositivo (consume una de las activaciones del código)
-  let a;
-  try { a = await lsLicenseCall('/activate', { license_key: key, instance_name: licenseDeviceName() }); }
-  catch (e) { return { ok: false, code: 'red' }; }
-  const ad = a.data;
-  if (!ad) return { ok: false, code: 'red' };
-  if (ad.activated && ad.instance && ad.instance.id) {
-    persistLicense({ key: key, instanceId: ad.instance.id, activatedAt: Date.now(), lastCheck: Date.now() });
+  const d = r.data;
+  if (r.status >= 500 || !d) return { ok: false, code: 'red' };
+  if (d.activated && d.instance_id) {
+    persistLicense({ key: key, instanceId: d.instance_id, activatedAt: Date.now(), lastCheck: Date.now() });
     return { ok: true };
   }
-  return { ok: false, code: classifyLicenseError(ad.error), limit: ad.license_key && ad.license_key.activation_limit };
+  if (d.error === 'limite') return { ok: false, code: 'limite', limit: d.limit };
+  if (d.error === 'desactivada') return { ok: false, code: 'desactivada' };
+  if (d.error === 'no_encontrado') return { ok: false, code: 'no_encontrado' };
+  return { ok: false, code: 'otro' };
 }
 
 /** Comprueba de fondo que el código siga vigente. Si no hay conexión, conserva el acceso. */
 async function revalidateLicense() {
   const s = LICENSE_STATE;
-  if (!s || !LICENSE_CONFIG.enabled) return;
+  if (!s || !LICENSE_CONFIG.enabled || !LM_EXT.apiUrl) return;
   if (Date.now() - (s.lastCheck || 0) < LICENSE_CONFIG.recheckMs) return;
   try {
-    const r = await lsLicenseCall('/validate', { license_key: s.key, instance_id: s.instanceId });
-    if (!r.data || r.status >= 500) return;
-    if (r.data.valid === false) { persistLicense(null); return; }
+    const r = await licenseApi('/session', { license_key: s.key, instance_id: s.instanceId });
+    if (r.status === 403) { persistLicense(null); return; }
+    if (r.status !== 200) return;
     s.lastCheck = Date.now();
     persistLicense(s);
   } catch (e) { /* sin conexión: se conserva el acceso */ }
@@ -3296,9 +3260,9 @@ async function deactivateLicenseHere() {
   const s = LICENSE_STATE;
   if (!s) return { ok: true };
   try {
-    const r = await lsLicenseCall('/deactivate', { license_key: s.key, instance_id: s.instanceId });
+    const r = await licenseApi('/deactivate', { license_key: s.key, instance_id: s.instanceId });
     const d = r.data;
-    if (d && (d.deactivated || /not found|no longer/i.test(String(d.error || '')))) { persistLicense(null); return { ok: true }; }
+    if (d && (d.deactivated || d.error === 'no_encontrado')) { persistLicense(null); return { ok: true }; }
     return { ok: false, code: 'otro' };
   } catch (e) { return { ok: false, code: 'red' }; }
 }
@@ -3373,7 +3337,7 @@ function buildPaywallBlock(opts) {
   text.textContent = 'Cuatro fases, el azar de cada decreto y tres finales posibles. Compra el juego, recibe tu código por correo y escríbelo aquí para empezar a gobernar.';
   const price = document.createElement('p');
   price.className = 'paywall__price';
-  price.textContent = 'Pago único de ' + LICENSE_CONFIG.priceLabel + ' CLP · Se juega en tu navegador (necesita internet), en hasta 2 dispositivos · Recibes tu código por correo apenas pagas. Pago procesado por Lemon Squeezy; según tu banco, el cargo puede verse en dólares.';
+  price.textContent = 'Pago único de ' + LICENSE_CONFIG.priceLabel + ' CLP · Se juega en tu navegador (necesita internet), en hasta 2 dispositivos · Pago procesado por Mercado Pago. Después de pagar, recibes tu código de acceso por correo (puede tardar unas horas; si no llega, escríbeme).';
   const or = document.createElement('p');
   or.className = 'paywall__or';
   or.textContent = '¿Ya compraste? Escribe tu código';
