@@ -3141,14 +3141,13 @@ function contentErrorSection(err) {
 //     verifica con el servidor del juego (Cloudflare Worker); en esta página
 //     no hay ningún secreto. Los códigos los emite el dueño desde /panel.
 //
-//     Para cambiar el enlace de compra o el precio mostrado se edita config.js
-//     (no este archivo).
+//     El precio que se muestra se edita en config.js (el cobro real lo fija el
+//     servidor del juego, que crea el pago en Mercado Pago).
 // ----------------------------------------------------------------------------
 // Los valores se leen de config.js (un archivo pequeño que se edita sin tocar este).
 const LM_EXT = (typeof window !== 'undefined' && window.LM_CONFIG && typeof window.LM_CONFIG === 'object') ? window.LM_CONFIG : {};
 const LICENSE_CONFIG = {
   enabled: true,
-  checkoutUrl: LM_EXT.checkoutUrl || 'https://mpago.la/1WQSaBw',
   priceLabel: LM_EXT.priceLabel || '$4.990',
   contactEmail: LM_EXT.contactEmail || 'smontecinos0@gmail.com',
   storageKey: 'lm_license_v1',
@@ -3315,13 +3314,141 @@ function buildLicenseForm(opts) {
 }
 
 function buildBuyLink() {
+  const wrap = document.createElement('div');
   const a = document.createElement('a');
   a.className = 'paywall__buy';
-  a.href = LICENSE_CONFIG.checkoutUrl;
-  a.target = '_blank';
-  a.rel = 'noopener noreferrer';
-  a.textContent = 'Comprar el juego · ' + LICENSE_CONFIG.priceLabel;
-  return a;
+  a.href = '#';
+  const label = 'Comprar el juego · ' + LICENSE_CONFIG.priceLabel;
+  a.textContent = label;
+  const msg = document.createElement('p');
+  msg.className = 'license-form__msg';
+  msg.setAttribute('role', 'status');
+  msg.setAttribute('aria-live', 'polite');
+  let busy = false;
+  a.addEventListener('click', async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    busy = true;
+    a.textContent = 'Abriendo el pago…';
+    msg.textContent = ''; msg.className = 'license-form__msg';
+    let fail = 'No pude abrir el pago. Inténtalo de nuevo o escríbeme a ' + LICENSE_CONFIG.contactEmail + '.';
+    try {
+      const r = await licenseApi('/checkout', {});
+      if (r.status === 200 && r.data && r.data.checkout_url) { window.location.assign(r.data.checkout_url); return; }
+    } catch (err) { fail = 'No pude conectarme para abrir el pago. Revisa tu conexión e inténtalo de nuevo.'; }
+    msg.textContent = fail; msg.className = 'license-form__msg is-error';
+    a.textContent = label;
+    busy = false;
+  });
+  wrap.appendChild(a); wrap.appendChild(msg);
+  return wrap;
+}
+
+// ----------------------------------------------------------------------------
+// Vuelta desde Mercado Pago: el cliente regresa con ?order_id=…&external_reference=…
+// El servidor confirma el pago con Mercado Pago y recién entonces entrega el código.
+// ----------------------------------------------------------------------------
+function paymentReturnParams() {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const id = q.get('order_id');
+    const ref = q.get('external_reference');
+    if (id && ref) return { id: id, ref: ref };
+  } catch (e) { /* sin parámetros */ }
+  return null;
+}
+
+function clearPaymentParams() {
+  try {
+    const u = new URL(window.location.href);
+    ['order_id', 'payment_id', 'collection_id', 'collection_status', 'status', 'external_reference', 'payment_type', 'merchant_order_id', 'preference_id', 'site_id', 'processing_mode', 'merchant_account_id'].forEach((k) => u.searchParams.delete(k));
+    window.history.replaceState(null, '', u.pathname + (u.search ? u.search : '') + u.hash);
+  } catch (e) { /* no pasa nada */ }
+}
+
+function buildPayOverlay() {
+  const prev = document.getElementById('pay-overlay');
+  if (prev) prev.remove();
+  const ov = document.createElement('div');
+  ov.id = 'pay-overlay';
+  ov.setAttribute('role', 'dialog');
+  ov.setAttribute('aria-modal', 'true');
+  ov.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;padding:1rem;background:rgba(12,7,3,.94);';
+  const card = document.createElement('div');
+  card.style.cssText = 'max-width:30rem;width:100%;max-height:92vh;overflow:auto;background:#f3e6c8;color:#2b1b0a;border:2px solid #c48a45;border-radius:14px;padding:1.4rem 1.3rem;box-shadow:0 10px 40px rgba(0,0,0,.6);text-align:center;font-family:Georgia,serif;line-height:1.5;';
+  ov.appendChild(card);
+  document.body.appendChild(ov);
+  return { ov: ov, card: card };
+}
+
+function payBtn(text, onClick, primary) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = text;
+  b.style.cssText = 'margin:.35rem .3rem 0;padding:.7rem 1.1rem;border-radius:999px;cursor:pointer;font-weight:600;font-size:.9rem;border:1.5px solid #8a5a22;' + (primary ? 'background:#c48a45;color:#1a1108;' : 'background:transparent;color:#4a3217;');
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function payPanel(ui, title, lines, extras) {
+  ui.card.textContent = '';
+  const h = document.createElement('h2');
+  h.textContent = title;
+  h.style.cssText = 'margin:0 0 .6rem;font-size:1.3rem;color:#3a2410;';
+  ui.card.appendChild(h);
+  (lines || []).forEach((t) => { const p = document.createElement('p'); p.textContent = t; p.style.cssText = 'margin:.5rem 0;'; ui.card.appendChild(p); });
+  (extras || []).forEach((n) => ui.card.appendChild(n));
+}
+
+async function handlePaymentReturn() {
+  const pr = paymentReturnParams();
+  if (!pr) return;
+  const ui = buildPayOverlay();
+  const mail = LICENSE_CONFIG.contactEmail;
+  const close = () => { clearPaymentParams(); ui.ov.remove(); };
+  const helpLine = 'Si ya pagaste y el problema sigue, escríbeme a ' + mail + ' con tu comprobante de Mercado Pago y te envío tu código.';
+
+  const run = async () => {
+    payPanel(ui, 'Confirmando tu pago…', ['Un momento, estoy verificando tu pago con Mercado Pago.']);
+    let r;
+    try { r = await licenseApi('/entrega', { order_id: pr.id, external_reference: pr.ref }); }
+    catch (e) { r = null; }
+    if (!r || r.status >= 500 || (!r.data)) {
+      payPanel(ui, 'No pude conectarme', ['Revisa tu conexión a internet e inténtalo de nuevo. Tu pago no se pierde.', helpLine], [payBtn('Reintentar', run, true)]);
+      return;
+    }
+    if (r.status === 200 && r.data.code) {
+      const code = r.data.code;
+      let activated = !!(LICENSE_STATE && LICENSE_STATE.key === code);
+      if (!activated) { try { const a = await activateLicenseKey(code); activated = !!a.ok; } catch (e) { activated = false; } }
+      const box = document.createElement('div');
+      box.textContent = code;
+      box.style.cssText = 'font-family:"Courier New",monospace;font-size:1.35rem;letter-spacing:.04em;background:#e8d6ae;border:1.5px dashed #8a5a22;border-radius:8px;padding:.75rem .6rem;margin:.8rem 0;word-break:break-all;user-select:all;';
+      const copy = payBtn('Copiar código', async () => {
+        try { await navigator.clipboard.writeText(code); copy.textContent = '¡Copiado!'; } catch (e) { copy.textContent = 'Selecciónalo y cópialo'; }
+      }, false);
+      const go = payBtn('Empezar a jugar', close, true);
+      payPanel(ui, '¡Pago confirmado! Gracias por tu compra',
+        [activated ? 'Tu acceso ya quedó activado en este dispositivo. Este es tu código de acceso; guárdalo, lo necesitarás si cambias de dispositivo (funciona en hasta 2):'
+                   : 'Este es tu código de acceso. Cópialo y escríbelo en la pantalla de acceso para activarlo:'],
+        [box, copy, go]);
+      return;
+    }
+    if (r.status === 202 || (r.data && r.data.error === 'pendiente')) {
+      payPanel(ui, 'Tu pago está en revisión', ['Mercado Pago todavía no lo confirma. Puede tardar unos minutos. Cuando lo apruebe, vuelve a abrir este mismo enlace, o toca "Reintentar".'], [payBtn('Reintentar', run, true), payBtn('Cerrar', close, false)]);
+      return;
+    }
+    if (r.status === 402 || (r.data && r.data.error === 'no_aprobado')) {
+      payPanel(ui, 'El pago no fue aprobado', ['Mercado Pago no aprobó este pago, así que no se entregó ningún código. Puedes intentarlo de nuevo con otro medio de pago.', 'Si crees que es un error, escríbeme a ' + mail + '.'], [payBtn('Cerrar', close, true)]);
+      return;
+    }
+    if (r.data && r.data.error === 'desactivada') {
+      payPanel(ui, 'Código desactivado', ['El código de esta compra fue desactivado. Escríbeme a ' + mail + ' y lo revisamos.'], [payBtn('Cerrar', close, true)]);
+      return;
+    }
+    payPanel(ui, 'No pude verificar este pago', [helpLine], [payBtn('Cerrar', close, true)]);
+  };
+  await run();
 }
 
 /** Bloque que reemplaza el botón "Continuar" cuando falta el código de acceso. */
@@ -4618,6 +4745,7 @@ async function continueSavedGame() {
 
 async function initGame() {
   revalidateLicense(); // de fondo; si no hay conexión, se conserva el acceso
+  handlePaymentReturn(); // si el cliente vuelve de Mercado Pago, confirma el pago y le entrega su código
   updateStatusBar();
   updateVisualStage(GameState);
   setupStatBarTooltips();
